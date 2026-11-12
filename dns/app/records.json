@@ -1,0 +1,17 @@
+{
+  "_comment": "Demo zone data for the local authoritative DNS. 'rebind_a' rotates answers PER CLIENT: the first A query returns the first address (inside the portal egress CIDR), every later query returns the next one (the internal decoy). This emulates a DNS rebinding attack entirely offline.",
+  "zones": {
+    "vendor.reports.local": {
+      "a": ["172.31.10.10"]
+    },
+    "intranet.internal": {
+      "a": ["172.31.20.66"]
+    },
+    "multi.reports.local": {
+      "a": ["172.31.10.10", "172.31.20.66"]
+    },
+    "rebind.reports.local": {
+      "rebind_a": ["172.31.10.10", "172.31.20.66"]
+    }
+  }
+}

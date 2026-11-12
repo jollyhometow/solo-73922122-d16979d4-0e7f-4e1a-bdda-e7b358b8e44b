@@ -1,6 +1,66 @@
-name: portal-logout-demo
+name: portal-report-demo
+
+# Two networks on purpose:
+#   reports 172.31.10.0/24  -> the ONLY range the portal may fetch from
+#                              (vendor + the configured DNS server live here)
+#   intranet 172.31.20.0/24 -> a separate internal network with the decoy
+#
+# The portal containers are attached to BOTH networks (so the demo can show
+# the decoy would be network-reachable but is policy-refused).  The fetcher's
+# fixed egress CIDR contains only 172.31.10.0/24, so nothing on
+# 172.31.20.0/24 can ever be contacted through /reports/download.
+networks:
+  reports:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.10.0/24
+  intranet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.20.0/24
 
 services:
+  # --- Local authoritative DNS (fixed portal resolver) -----------------------
+  dns:
+    build: ./dns
+    ports:
+      - "1053:53/udp"
+      - "1053:53/tcp"
+      - "1054:8080"
+    networks:
+      reports:
+        ipv4_address: 172.31.10.53
+    restart: unless-stopped
+
+  # --- Supplier report service (inside the allowed CIDR) ---------------------
+  vendor:
+    build: ./vendor
+    ports:
+      - "8080:8080"
+    environment:
+      VENDOR_INTERNAL_REDIRECT_BASE: http://intranet.internal:8080
+    networks:
+      reports:
+        ipv4_address: 172.31.10.10
+    depends_on:
+      - dns
+    restart: unless-stopped
+
+  # --- Internal decoy (outside the allowed CIDR; must never receive traffic) -
+  decoy:
+    build: ./decoy
+    ports:
+      - "8090:8080"
+    networks:
+      intranet:
+        ipv4_address: 172.31.20.66
+    restart: unless-stopped
+
+  # --- Existing identity source ----------------------------------------------
   idp:
     build: ./idp
     ports:
@@ -14,6 +74,9 @@ services:
         http://portal2:8000/backchannel-logout
     volumes:
       - ./deploy/keys:/keys:ro
+    networks:
+      reports:
+        ipv4_address: 172.31.10.20
 
   portal1:
     build: ./portal
@@ -25,11 +88,27 @@ services:
       IDP_AUDIENCE: enterprise-portal
       IDP_TOKEN_URL: http://idp:9000/token
       PORTAL_DB_PATH: /data/portal.db
+      # Report download egress policy, FIXED at process start.
+      EGRESS_ALLOWED_CIDRS: 172.31.10.0/24
+      EGRESS_ALLOWED_PORTS: "80,8080"
+      EGRESS_DNS_SERVERS: 172.31.10.53
+      EGRESS_DNS_PORT: "53"
+      EGRESS_MAX_REDIRECTS: "3"
+      EGRESS_TOTAL_TIMEOUT: "5"
+      EGRESS_MAX_BODY_BYTES: "1048576"
     volumes:
       - ./deploy/keys:/keys:ro
       - portal-data:/data
+    networks:
+      reports:
+        ipv4_address: 172.31.10.11
+      intranet:
+        ipv4_address: 172.31.20.11
     depends_on:
       - idp
+      - dns
+      - vendor
+      - decoy
 
   portal2:
     build: ./portal
@@ -39,8 +118,16 @@ services:
     volumes:
       - ./deploy/keys:/keys:ro
       - portal-data:/data
+    networks:
+      reports:
+        ipv4_address: 172.31.10.12
+      intranet:
+        ipv4_address: 172.31.20.12
     depends_on:
       - idp
+      - dns
+      - vendor
+      - decoy
 
 volumes:
   # Shared by both portal replicas: one SQLite file, so logout / login /

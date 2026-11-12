@@ -8,6 +8,9 @@ POST /login               exchange an authorization code at the IdP, then
 POST /backchannel-logout  receive a logout JWT from the IdP, persist the
                           target's max logout iat, revoke covered sessions.
 GET  /me                  resolve the random session credential.
+POST /reports/download    fetch a support-supplied http URL under the fixed
+                          egress policy and return the full body as an
+                          attachment (SSRF-hardened, see app/fetcher.py).
 GET  /debug/state         demo aid: current cutoffs / counters.
 GET  /healthz             liveness.
 
@@ -28,28 +31,32 @@ logout processing in the same process.
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import time
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from . import config, security
 from .db import Database
+from .fetcher import EgressPolicyError, UpstreamFetchError, download
 
 db = Database(config.DB_PATH)
 
 app = FastAPI(
     title="Enterprise Portal",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Portal with back-channel logout. Demo flow: get a code from the IdP "
-        "(`POST {idp}/authorize`), exchange it via `POST /login` below, call "
-        "`GET /me` with the returned `session_id` (Authorize button), then "
-        "log the user out at the IdP (`POST {idp}/logout`) and watch "
-        "`GET /me` turn 401."
+        "Portal with back-channel logout and an SSRF-hardened report download. "
+        "Demo flow: get a code from the IdP (`POST {idp}/authorize`), exchange "
+        "it via `POST /login` below, call `GET /me` with the returned "
+        "`session_id` (Authorize button), then `POST /reports/download` with a "
+        "support-supplied http URL to receive the report body as an attachment. "
+        "Log the user out at the IdP (`POST {idp}/logout`) and watch `GET /me` "
+        "turn 401."
     ),
 )
 
@@ -67,6 +74,34 @@ class LogoutRequest(BaseModel):
     logout_token: str = Field(
         ..., description="RS256 logout JWT (purpose=logout, jti, iat, exp, sid and/or sub)"
     )
+
+
+class ReportDownloadRequest(BaseModel):
+    url: str = Field(
+        ...,
+        max_length=2048,
+        description=(
+            "Support-supplied report URL. Only plain http:// URLs with no "
+            "userinfo are accepted; every address (initial and each redirect) "
+            "must resolve to an IPv4 inside the fixed egress CIDRs/ports."
+        ),
+        json_schema_extra={"examples": ["http://vendor.reports.local/reports/diagnostic.txt"]},
+    )
+
+
+def require_session(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> sqlite3.Row:
+    """Shared session gate used by every authenticated endpoint."""
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="missing session credential")
+    row = db.read_one(
+        "SELECT sub, sid, id_token_iat, created_at FROM sessions WHERE session_id = ?",
+        (credentials.credentials,),
+    )
+    if row is None:
+        raise HTTPException(status_code=401, detail="session unknown or revoked")
+    return row
 
 
 @app.get("/", include_in_schema=False)
@@ -189,21 +224,48 @@ def backchannel_logout(body: LogoutRequest):
 
 
 @app.get("/me", summary="Resolve the current session")
-def me(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
-    if credentials is None or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="missing session credential")
-    row = db.read_one(
-        "SELECT sub, sid, id_token_iat, created_at FROM sessions WHERE session_id = ?",
-        (credentials.credentials,),
-    )
-    if row is None:
-        raise HTTPException(status_code=401, detail="session unknown or revoked")
+def me(row: sqlite3.Row = Depends(require_session)):
     return {
         "sub": row["sub"],
         "sid": row["sid"],
         "id_token_iat": row["id_token_iat"],
         "created_at": row["created_at"],
     }
+
+
+@app.post(
+    "/reports/download",
+    summary="Download a support report URL under the fixed egress policy",
+    responses={
+        200: {"content": {"application/octet-stream": {}}, "description": "Full report body, as attachment"},
+        400: {"description": "URL violates the egress policy (scheme/userinfo/CIDR/port/redirect limit)"},
+        502: {"description": "Policy passed but the upstream fetch failed"},
+        504: {"description": "The 5 s overall time budget was exhausted"},
+    },
+)
+def download_report(body: ReportDownloadRequest, row: sqlite3.Row = Depends(require_session)):
+    # Session gate first (require_session); nothing is fetched anonymously.
+    # The fetcher enforces: http-only + no userinfo, configured-DNS A lookups,
+    # every address inside the startup-fixed CIDRs/ports (initial + every
+    # redirect), address-pinned connections with the original Host header and
+    # no re-resolution, <=3 redirects, 5 s total, <=1 MiB body, no cookies and
+    # no portal credentials forwarded.  Failures never return a partial body.
+    try:
+        data, content_type, filename = download(body.url)
+    except EgressPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except UpstreamFetchError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    # Only carry the media type; drop any upstream Content-Disposition and
+    # always force an attachment so the body is downloaded, not rendered.
+    media_type = content_type.split(";", 1)[0].strip() or "application/octet-stream"
+    safe_filename = filename.replace('"', "")
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
 
 
 @app.get("/debug/state", summary="Demo aid: persisted logout cutoffs and counters")
@@ -220,4 +282,23 @@ def debug_state():
         "logout_cutoffs": [dict(r) for r in cutoffs],
         "active_sessions": [dict(r) for r in sessions],
         "processed_logout_jtis": jtis["n"],
+    }
+
+
+@app.get("/debug/egress-policy", summary="Demo aid: the fixed report-download egress policy")
+def debug_egress_policy():
+    # Read-only view of what the fetcher will accept; it cannot be changed here.
+    return {
+        "allowed_cidrs": [str(network) for network in config.EGRESS_ALLOWED_CIDRS],
+        "allowed_ports": sorted(config.EGRESS_ALLOWED_PORTS),
+        "dns_servers": list(config.EGRESS_DNS_SERVERS),
+        "dns_port": config.EGRESS_DNS_PORT,
+        "max_redirects": config.EGRESS_MAX_REDIRECTS,
+        "total_timeout_seconds": config.EGRESS_TOTAL_TIMEOUT,
+        "max_body_bytes": config.EGRESS_MAX_BODY_BYTES,
+        "schemes": ["http"],
+        "ip_versions": [4],
+        "userinfo_allowed": False,
+        "cookies_shared_across_requests": False,
+        "portal_identity_forwarded": False,
     }
